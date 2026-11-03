@@ -1,153 +1,337 @@
-#!/usr/bin/env python3
-"""
-语音检测工具
-检测视频是否有口播（人类语音），区分无口播视频
+# -*- coding: utf-8 -*-
+"""爆款视频链接解析与结构化文案提取。
+
+流水线：
+    A. yt-dlp 解析短视频链接，只拉最高音质音轨，ffmpeg 转成 192kbps mp3
+    B. 对接大厂 ASR（当前为带句子级时间戳的模拟桩）
+    C. 毫秒时间戳统一换算成秒，保留两位小数
+
+用法：
+    python3 video_soul_extractor.py "https://www.youtube.com/watch?v=xxxxxxxxxxx"
 """
 
+import json
 import os
-import tempfile
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from typing import Dict, List
 
-import librosa
-import numpy as np
-from pydub import AudioSegment
-from pydub.silence import detect_nonsilent
+import yt_dlp
 
 
-class SpeechDetector:
+def _ffmpeg_bin() -> str:
+    """定位 ffmpeg 可执行文件，优先用系统 PATH 里的。"""
+    found = shutil.which("ffmpeg")
+    if not found:
+        raise RuntimeError("系统中未找到 ffmpeg，请先安装并加入 PATH")
+    return found
+
+
+# 抖音解析走公开解析服务，yt-dlp 直接下抖音会被要求 Cookie
+DOUYIN_PARSE_BASE = os.environ.get("DOUYIN_PARSE_BASE", "https://demo.douyin.wtf")
+DOUYIN_PARSE_KEY = os.environ.get("DOUYIN_PARSE_KEY", "dtk_df6373c8dd2f_b39OkgSfqI2BN8HP-jPxo3k5bvkyxvrg")
+
+
+def _clean_video_url(text: str) -> str:
+    """从抖音分享文案里取出真实链接。
+
+    分享文案形如「4.84 复制此链接，打开Dou音搜索…… https://v.douyin.com/xxxx/」，
+    短链后面还粘着说明文字，只保留链接本身。
     """
-    检测视频是否有语音
-    如果整段视频没有人声，认为是无口播视频
-    """
-    def __init__(self, speech_threshold_db=-40, min_speech_ms=500):
-        """
-        :param speech_threshold_db: 语音阈值，低于此值认为是非语音（默认为-40dB）
-        :param min_speech_ms: 语音片段的起码长度（毫秒）
-        """
-        self.speech_threshold_db = speech_threshold_db
-        self.min_speech_ms = min_speech_ms
-
-    def has_speech(self, audio_path):
-        """
-        检测音频文件是否含有人声
-        :param audio_path: 音频文件路径（支持 mp3, wav, m4a, aac）
-        :return: True 如果有语音，False 如果没有
-        """
+    match = re.search(r"https?://[^\s]+", text or "")
+    if not match:
+        raise RuntimeError("没有在文案里找到视频链接")
+    url = match.group(0).rstrip(".,;:)]}>，。；：、！!）】\"'")
+    # 抖音短链 v.douyin.com 跳一次，拿到最终的视频地址
+    if re.search(r"://v\.douyin\.com/", url):
+        req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "Mozilla/5.0"})
         try:
-            # 用 pydub 加载音频
-            audio = AudioSegment.from_file(audio_path)
-        except Exception as e:
-            raise RuntimeError(f"Failed to load audio: {e}")
-
-        # 转为单声道，统一采样率 16kHz（语音检测常用）
-        audio = audio.set_channels(1).set_frame_rate(16000)
-        # 分帧，每一帧 20ms
-        frame_length = 20  # ms
-        frames = [audio[i:i+frame_length] for i in range(0, len(audio), frame_length)]
-        # 计算每帧的 RMS 能量（dB）
-        frame_db = [frame.dBFS for frame in frames]
-
-        # 找出能量超过阈值的连续区间
-        speech_segments = []
-        in_speech = False
-        start = 0
-        for i, db in enumerate(frame_db):
-            if db > self.speech_threshold_db:
-                if not in_speech:
-                    start = i
-                    in_speech = True
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                url = resp.geturl()
+        except urllib.error.HTTPError as exc:
+            if exc.headers.get("Location"):
+                url = urllib.request.urljoin(url, exc.headers["Location"])
             else:
-                if in_speech:
-                    duration = (i - start) * frame_length
-                    if duration >= self.min_speech_ms:
-                        speech_segments.append((start * frame_length, i * frame_length))
-                    in_speech = False
-        if in_speech:
-            duration = (len(frame_db) - start) * frame_length
-            if duration >= self.min_speech_ms:
-                speech_segments.append((start * frame_length, len(frame_db) * frame_length))
-
-        if speech_segments:
-            return True
-        return False
+                raise
+    return url
 
 
-class VideoSpeechExtractor:
-    """
-    从视频中提取音频并检测口播
-    """
-    def __init__(self, detector=None):
-        self.detector = detector or SpeechDetector()
-
-    def has_speech_from_video(self, video_path):
-        """
-        从视频文件提取音频，检测是否有语音
-        :param video_path: 视频文件路径（mp4、mov 等）
-        :return: True 如果有语音，False 如果没有
-        """
-        # 临时文件存放提取的音频
-        tmp_dir = tempfile.mkdtemp()
-        audio_path = os.path.join(tmp_dir, 'audio.mp3')
+def _download_with_retry(url: str, dest: str, attempts: int = 3) -> None:
+    """下载视频文件，CDN 偶发 403 时隔几秒重试。"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Referer": "https://www.douyin.com/",
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    }
+    last = None
+    for _ in range(attempts):
         try:
-            # 使用 ffmpeg 提取音频（如果使用 moviepy 则依赖 moviepy）
-            # 这里用系统 ffmpeg
-            cmd = f'ffmpeg -y -i "{video_path}" -vn -ar 16000 -ac 1 -ab 128k -f mp3 "{audio_path}"'
-            os.system(cmd + ' > nul 2>&1')
-            if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
-                raise RuntimeError("Failed to extract audio from video")
-            return self.detector.has_speech(audio_path)
-        except Exception as e:
-            raise RuntimeError(f"Video speech detection failed: {e}")
-        finally:
-            # 清理临时文件
-            try:
-                if os.path.exists(audio_path):
-                    os.unlink(audio_path)
-                os.rmdir(tmp_dir)
-            except OSError:
-                pass
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=180) as resp, open(dest, "wb") as fh:
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+            return
+        except urllib.error.HTTPError as exc:
+            last = exc
+            time.sleep(4)
+    raise RuntimeError(f"视频下载失败：{last}")
 
-    def split_speech_segments(self, audio_path, min_silence_ms=500, silence_thresh_db=-40):
-        """
-        将音频按静音切分成语音段落（用于有口播路径的句子级处理）
-        :param audio_path: 音频文件
-        :param min_silence_ms: 最小静音长度（毫秒）
-        :param silence_thresh_db: 静音阈值（dB）
-        :return: 列表，每个元素为 (start_ms, end_ms)
-        """
-        audio = AudioSegment.from_file(audio_path)
-        # 检测非静音区间
-        nonsilent = detect_nonsilent(
-            audio,
-            min_silence_len=min_silence_ms,
-            silence_thresh=silence_thresh_db
+
+def _douyin_video_urls(video_url: str) -> list:
+    """用解析服务拿到抖音视频的全部候选下载地址。"""
+    body = json.dumps({"url": video_url}).encode()
+    data = None
+    for _ in range(6):
+        req = urllib.request.Request(
+            f"{DOUYIN_PARSE_BASE}/api/v1/parse",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-API-Key": DOUYIN_PARSE_KEY,
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            },
         )
-        # 合并相邻的区间（间隔小于最小静音长度视为同一句）
-        merged = []
-        for start, end in nonsilent:
-            if merged and start - merged[-1][1] < min_silence_ms:
-                merged[-1] = (merged[-1][0], end)
-            else:
-                merged.append((start, end))
-        return merged
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read().decode())
+            break
+        except urllib.error.HTTPError:
+            time.sleep(20)
+    if data is None:
+        raise RuntimeError("抖音解析服务暂时拒绝请求，稍后重试")
+    task_id = (data.get("data") or {}).get("task_id")
+    if not task_id:
+        raise RuntimeError(f"抖音解析没有返回任务：{json.dumps(data, ensure_ascii=False)[:200]}")
+
+    for _ in range(20):
+        time.sleep(3)
+        poll = urllib.request.Request(
+            f"{DOUYIN_PARSE_BASE}/api/v1/tasks/{task_id}",
+            headers={
+                "X-API-Key": DOUYIN_PARSE_KEY,
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            },
+        )
+        with urllib.request.urlopen(poll, timeout=30) as resp:
+            result = json.loads(resp.read().decode())
+        payload = result.get("data") or {}
+        state = payload.get("state")
+        if state == "done":
+            media = ((payload.get("data") or {}).get("media") or {}).get("video") or {}
+            urls = []
+            for candidate in [media.get("url")] + list(media.get("urls") or []):
+                if candidate and candidate not in urls:
+                    urls.append(candidate)
+            if not urls:
+                raise RuntimeError("抖音解析完成但没有视频地址")
+            return urls
+        if state in ("failed", "error"):
+            raise RuntimeError(f"抖音解析失败：{json.dumps(payload, ensure_ascii=False)[:200]}")
+    raise RuntimeError("抖音解析超时")
 
 
-def test():
-    """测试语音检测"""
-    # 示例：提供一个视频路径（需要实际存在）
-    import sys
-    if len(sys.argv) > 1:
-        video_path = sys.argv[1]
+def _download_audio(video_url: str, output_dir: str) -> Dict[str, str]:
+    """步骤 A：下载原视频，同时抽出 192kbps 的 mp3 供语音识别。
+
+    抖音链接先经解析服务换成直链，其余平台仍用 yt-dlp。
+    返回 {"video_id", "audio_file_path", "video_file_path"}。
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    douyin_id = re.search(r"douyin\.com/video/(\d+)", video_url)
+    if douyin_id:
+        video_id = douyin_id.group(1)
+        urls = _douyin_video_urls(video_url)
+        video_path = os.path.abspath(os.path.join(output_dir, f"{video_id}.mp4"))
+        # CDN 地址时好时坏，逐个试到能下为止
+        last = None
+        for direct in urls:
+            try:
+                _download_with_retry(direct, video_path, attempts=1)
+                last = None
+                break
+            except RuntimeError as exc:
+                last = exc
+        if last:
+            raise last
     else:
-        return "Usage: python video_speech_extractor.py <video_path>"
-    extractor = VideoSpeechExtractor()
+        video_id, video_path = _ytdlp_download(video_url, output_dir)
+
+    if not os.path.isfile(video_path):
+        raise RuntimeError(f"视频下载完成但未找到文件：{video_path}")
+
+    # 抽出音轨并钉死在 192kbps，供语音识别使用
+    audio_path = os.path.abspath(os.path.join(output_dir, f"{video_id}.mp3"))
+    proc = subprocess.run(
+        [_ffmpeg_bin(), "-y", "-i", video_path, "-vn", "-acodec", "libmp3lame", "-b:a", "192k", audio_path],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0 or not os.path.isfile(audio_path):
+        detail = (proc.stderr or "").strip().splitlines()
+        tail = detail[-1] if detail else "ffmpeg 未返回错误信息"
+        raise RuntimeError(f"ffmpeg 转码失败：{tail}")
+
+    return {"video_id": video_id, "audio_file_path": audio_path, "video_file_path": video_path}
+
+
+def _ytdlp_download(video_url: str, output_dir: str):
+
+    options = {
+        "format": "bv*[height<=720]+ba/b[height<=720]/best",
+        "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "overwrites": True,
+        "merge_output_format": "mp4",
+        "ffmpeg_location": _ffmpeg_bin(),
+    }
+
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(video_url, download=True)
+        # 播放列表链接只取第一条
+        if info.get("_type") == "playlist":
+            entries = [e for e in (info.get("entries") or []) if e]
+            if not entries:
+                raise RuntimeError("播放列表为空，没有可下载的视频")
+            info = entries[0]
+        video_id = str(info.get("id") or "").strip()
+        if not video_id:
+            raise RuntimeError("未能从链接中解析出视频唯一 ID")
+
+    video_path = os.path.abspath(os.path.join(output_dir, f"{video_id}.mp4"))
+    if not os.path.isfile(video_path):
+        raise RuntimeError(f"视频下载完成但未找到文件：{video_path}")
+    return video_id, video_path
+
+
+# 识别模型只加载一次，避免每次请求都重新读权重
+_ASR_MODEL = None
+
+
+def _asr_model():
+    global _ASR_MODEL
+    if _ASR_MODEL is None:
+        from faster_whisper import WhisperModel
+        # 服务器无 GPU，small + int8 约占 1.5GB 内存
+        _ASR_MODEL = WhisperModel(
+            "small", device="cpu", compute_type="int8", cpu_threads=6,
+        )
+    return _ASR_MODEL
+
+
+def _call_asr_service(audio_path: str) -> dict:
+    """步骤 B：用 faster-whisper 对实际音频做语音识别。
+
+    返回句子级结果，时间戳单位为毫秒，供步骤 C 统一换算。
+    模型按音频内容自动判断语言。
+    识别不到人声时不报错，返回空句子，交给上游走画面重绘。
+    """
+    if not os.path.isfile(audio_path):
+        raise RuntimeError(f"ASR 输入音频不存在：{audio_path}")
+
+    segments, info = _asr_model().transcribe(
+        audio_path,
+        vad_filter=True,
+        beam_size=5,
+    )
+    # 只有识别成中文、而且置信度够，才当成口播。
+    # 背景音乐经常被硬猜成外语句子，那种情况只重绘画面、不加字幕。
+    spoken = info.language == "zh" and info.language_probability >= 0.6
+    sentences = []
+    if spoken:
+        for segment in segments:
+            text = segment.text.strip()
+            if not text:
+                continue
+            sentences.append({
+                "text": text,
+                "start_ms": int(round(segment.start * 1000)),
+                "end_ms": int(round(segment.end * 1000)),
+            })
+    return {"sentences": sentences}
+
+
+def _normalize_timeline(asr_result: dict) -> List[dict]:
+    """步骤 C：毫秒转秒，保留两位小数，整理成时间轴结构。"""
+    sentences = asr_result.get("sentences") or []
+    if not sentences:
+        raise RuntimeError("ASR 没有返回任何句子")
+
+    timeline = []
+    for sentence in sentences:
+        text = str(sentence.get("text") or "").strip()
+        if not text:
+            continue
+        start_sec = round(float(sentence["start_ms"]) / 1000, 2)
+        end_sec = round(float(sentence["end_ms"]) / 1000, 2)
+        timeline.append({
+            "text": text,
+            "start_span": start_sec,
+            "end_span": end_sec,
+        })
+
+    if not timeline:
+        raise RuntimeError("ASR 结果清洗后没有有效句子")
+    return timeline
+
+
+def extract_vocal_and_timeline(video_url: str, output_dir: str = "./download_cache") -> dict:
+    """主控函数：解析短视频链接，下载音频，返回结构化口播文案。
+
+    成功返回 status=success 及 video_id、音频路径、全文、句子时间轴。
+    解析失败、链接失效或平台封禁时返回 {"status": "error", "message": "..."}，不抛异常。
+    """
     try:
-        has = extractor.has_speech_from_video(video_path)
-        print(f"Has speech: {has}")
-        return has
-    except Exception as e:
-        print(f"Error: {e}")
-        return False
+        if not video_url or not str(video_url).strip():
+            raise RuntimeError("视频链接为空")
+
+        downloaded = _download_audio(_clean_video_url(video_url), output_dir)
+        asr_result = _call_asr_service(downloaded["audio_file_path"])
+        if not asr_result["sentences"]:
+            # 没有口播：保留原视频和背景音，交给画面重绘
+            return {
+                "status": "success",
+                "has_speech": False,
+                "video_id": downloaded["video_id"],
+                "video_file_path": downloaded.get("video_file_path", ""),
+                "audio_file_path": downloaded["audio_file_path"],
+                "full_text": "",
+                "timeline_structure": [],
+            }
+        timeline = _normalize_timeline(asr_result)
+        full_text = "".join(item["text"] for item in timeline)
+
+        return {
+            "status": "success",
+            "video_id": downloaded["video_id"],
+            "audio_file_path": downloaded["audio_file_path"],
+            "video_file_path": downloaded.get("video_file_path", ""),
+            "full_text": full_text,
+            "timeline_structure": timeline,
+            "has_speech": True,
+        }
+    except Exception as exc:  # 链接失效、反爬封禁、转码失败都走这里
+        return {"status": "error", "message": str(exc)}
 
 
-if __name__ == '__main__':
-    test()
+if __name__ == "__main__":
+    # 用法：python3 video_soul_extractor.py "视频链接"
+    # 不传参数时用一条公开的 YouTube 短视频做冒烟测试
+    test_url = (
+        sys.argv[1]
+        if len(sys.argv) > 1
+        else "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+    )
+    cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "download_cache")
+    result = extract_vocal_and_timeline(test_url, cache_dir)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
